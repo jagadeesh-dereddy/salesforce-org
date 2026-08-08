@@ -6,6 +6,7 @@ on:
     paths:
       - 'force-app/**'
       - 'manifest/**'
+  workflow_dispatch: {}
 
 env:
   SF_USE_GENERIC_UNIX_KEYCHAIN: true
@@ -64,7 +65,7 @@ jobs:
 
           # On the branch's first push, github.event.before is all zeros - fall back
           # to diffing against the parent commit instead.
-          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
             BEFORE_SHA=$(git rev-parse "$AFTER_SHA^" 2>/dev/null || echo "$AFTER_SHA")
           fi
 
