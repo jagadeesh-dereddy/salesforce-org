@@ -6,7 +6,12 @@ on:
     paths:
       - 'force-app/**'
       - 'manifest/**'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      from_ref:
+        description: 'Git ref/SHA to diff from (defaults to the previous commit)'
+        required: false
+        type: string
 
 env:
   SF_USE_GENERIC_UNIX_KEYCHAIN: true
@@ -60,11 +65,11 @@ jobs:
 
       - name: Generate Delta Package
         run: |
-          BEFORE_SHA="${{ github.event.before }}"
+          BEFORE_SHA="${{ inputs.from_ref || github.event.before }}"
           AFTER_SHA="${{ github.sha }}"
 
-          # On the branch's first push, github.event.before is all zeros - fall back
-          # to diffing against the parent commit instead.
+          # On the branch's first push (or a manual dispatch with no from_ref),
+          # github.event.before is empty/all-zeros - fall back to the parent commit.
           if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
             BEFORE_SHA=$(git rev-parse "$AFTER_SHA^" 2>/dev/null || echo "$AFTER_SHA")
           fi
@@ -86,7 +91,7 @@ jobs:
             echo "No package.xml generated"
           fi
 
-          if [ ! -f "delta/package/package.xml" ] || [ ! -s "delta/package/package.xml" ]; then
+          if [ ! -f "delta/package/package.xml" ] || ! grep -q "<members>" delta/package/package.xml; then
             echo "No metadata changes detected"
             echo "SKIP_DEPLOYMENT=true" >> $GITHUB_ENV
           else

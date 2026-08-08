@@ -79,7 +79,7 @@ jobs:
             echo "No package.xml generated"
           fi
 
-          if [ ! -f "delta/package/package.xml" ] || [ ! -s "delta/package/package.xml" ]; then
+          if [ ! -f "delta/package/package.xml" ] || ! grep -q "<members>" delta/package/package.xml; then
             echo "No metadata changes detected"
             echo "SKIP_VALIDATION=true" >> $GITHUB_ENV
           else
