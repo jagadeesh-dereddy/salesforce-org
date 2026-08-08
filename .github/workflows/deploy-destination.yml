@@ -6,6 +6,7 @@ on:
     paths:
       - 'force-app/**'
       - 'manifest/**'
+  workflow_dispatch: {}
 
 env:
   SF_USE_GENERIC_UNIX_KEYCHAIN: true
