@@ -10,6 +10,7 @@ on:
 env:
   SF_USE_GENERIC_UNIX_KEYCHAIN: true
   SF_DOMAIN_RETRY: 300
+  NODE_OPTIONS: --dns-result-order=ipv4first
   SF_DISABLE_APP_HUB: true
   SF_LOG_LEVEL: DEBUG
 
@@ -26,7 +27,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'
 
       - name: Install Salesforce CLI
         run: |
