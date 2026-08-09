@@ -46,6 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.map.outputs.environment }}
+      test_level: ${{ steps.map.outputs.test_level }}
     steps:
       - name: Map branch to Salesforce environment
         id: map
@@ -65,8 +66,19 @@ jobs:
                 ;;
             esac
           fi
+
+          # Apex tests are intentionally skipped for the dev/qa deploys to
+          # keep that feedback loop fast; UAT and Production always run
+          # local tests. (Salesforce disallows NoTestRun for Production
+          # outright, so this would be a hard requirement there regardless.)
+          case "$ENVIRONMENT" in
+            dev|qa)         TEST_LEVEL="NoTestRun" ;;
+            uat|production) TEST_LEVEL="RunLocalTests" ;;
+          esac
+
           echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
-          echo "Deploying branch '${{ github.ref_name }}' -> the '$ENVIRONMENT' org"
+          echo "test_level=$TEST_LEVEL" >> "$GITHUB_OUTPUT"
+          echo "Deploying branch '${{ github.ref_name }}' -> '$ENVIRONMENT' with test level '$TEST_LEVEL'"
 
   deploy:
     needs: determine-environment
@@ -174,12 +186,12 @@ jobs:
         if: env.SKIP_DEPLOYMENT == 'false'
         run: |
           set -euo pipefail
-          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' before deploying"
+          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' with test level '${{ needs.determine-environment.outputs.test_level }}' before deploying"
 
           if ! VALIDATION_RESULT=$(sf project deploy validate \
                 --manifest delta/package/package.xml \
                 --target-org target-org \
-                --test-level RunLocalTests \
+                --test-level "${{ needs.determine-environment.outputs.test_level }}" \
                 --wait 30 \
                 --json); then
             echo "$VALIDATION_RESULT" | jq . 2>/dev/null || echo "$VALIDATION_RESULT"
