@@ -181,17 +181,45 @@ jobs:
             echo "SKIP_DEPLOYMENT=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Validate deployment
-        id: validate_step
-        if: env.SKIP_DEPLOYMENT == 'false'
+      # dev/qa: deploy directly with NoTestRun, no separate validate step.
+      # `sf project deploy validate` (checkOnly) rejects NoTestRun outright -
+      # Salesforce doesn't consider a dry-run with zero tests meaningful - so
+      # the validate+quick-deploy two-step pattern can't be used here at all.
+      # A direct one-step deploy is the only way to actually skip tests.
+      - name: Deploy directly (dev/qa - tests skipped for fast iteration)
+        id: direct_deploy_step
+        if: env.SKIP_DEPLOYMENT == 'false' && (needs.determine-environment.outputs.test_level == 'NoTestRun')
         run: |
           set -euo pipefail
-          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' with test level '${{ needs.determine-environment.outputs.test_level }}' before deploying"
+          echo "Deploying directly to '${{ needs.determine-environment.outputs.environment }}' with test level 'NoTestRun'"
+
+          if ! DEPLOY_RESULT=$(sf project deploy start \
+                --manifest delta/package/package.xml \
+                --target-org target-org \
+                --test-level NoTestRun \
+                --wait 30 \
+                --json); then
+            echo "$DEPLOY_RESULT" | jq . 2>/dev/null || echo "$DEPLOY_RESULT"
+            echo "::error::Deploy failed against '${{ needs.determine-environment.outputs.environment }}'"
+            exit 1
+          fi
+
+          echo "$DEPLOY_RESULT" | jq -r '.result.id' | xargs -I{} echo "deploy_id={}" >> "$GITHUB_OUTPUT"
+
+      # uat/production: validate first (RunLocalTests, mandatory - Salesforce
+      # disallows NoTestRun for Production regardless of policy), then quick
+      # deploy the exact package that was just validated.
+      - name: Validate deployment (uat/production - tests required)
+        id: validate_step
+        if: env.SKIP_DEPLOYMENT == 'false' && (needs.determine-environment.outputs.test_level == 'RunLocalTests')
+        run: |
+          set -euo pipefail
+          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' with test level 'RunLocalTests' before deploying"
 
           if ! VALIDATION_RESULT=$(sf project deploy validate \
                 --manifest delta/package/package.xml \
                 --target-org target-org \
-                --test-level "${{ needs.determine-environment.outputs.test_level }}" \
+                --test-level RunLocalTests \
                 --wait 30 \
                 --json); then
             echo "$VALIDATION_RESULT" | jq . 2>/dev/null || echo "$VALIDATION_RESULT"
@@ -220,9 +248,10 @@ jobs:
           {
             echo "### Deploy summary"
             echo "- **Environment:** ${{ needs.determine-environment.outputs.environment }}"
+            echo "- **Test level:** ${{ needs.determine-environment.outputs.test_level }}"
             echo "- **Branch:** ${{ github.ref_name }}"
             echo "- **Commit:** ${{ github.sha }}"
-            echo "- **Validation ID:** ${{ steps.validate_step.outputs.validation_id || 'n/a (no changes deployed)' }}"
+            echo "- **Deploy ID:** ${{ steps.direct_deploy_step.outputs.deploy_id || steps.validate_step.outputs.validation_id || 'n/a (no changes deployed)' }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Revoke Salesforce session and remove key material
