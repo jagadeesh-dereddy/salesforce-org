@@ -43,7 +43,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.map.outputs.environment }}
-      test_level: ${{ steps.map.outputs.test_level }}
     steps:
       - name: Map target branch to Salesforce environment
         id: map
@@ -60,20 +59,8 @@ jobs:
               exit 1
               ;;
           esac
-
-          # Apex tests are intentionally skipped for the dev/qa promotion
-          # steps to keep that feedback loop fast; UAT and Production are
-          # where test coverage is actually enforced as a merge gate.
-          # (Salesforce disallows NoTestRun for Production outright, so this
-          # would be a hard requirement there even without the policy.)
-          case "$ENVIRONMENT" in
-            dev|qa)         TEST_LEVEL="NoTestRun" ;;
-            uat|production) TEST_LEVEL="RunLocalTests" ;;
-          esac
-
           echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
-          echo "test_level=$TEST_LEVEL" >> "$GITHUB_OUTPUT"
-          echo "PR into '${{ github.base_ref }}' -> validating against '$ENVIRONMENT' with test level '$TEST_LEVEL'"
+          echo "PR into '${{ github.base_ref }}' -> validating against the '$ENVIRONMENT' org"
 
   validate:
     needs: determine-environment
@@ -180,12 +167,19 @@ jobs:
         if: env.SKIP_VALIDATION == 'false'
         run: |
           set -euo pipefail
-          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' with test level '${{ needs.determine-environment.outputs.test_level }}' (merge gate only - nothing is deployed)"
+          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' (merge gate only - nothing is deployed)"
 
+          # Every environment runs RunLocalTests here, not just uat/production:
+          # `sf project deploy validate` (checkOnly) rejects NoTestRun outright
+          # ("Expected --test-level=NoTestRun to be one of: RunAllTestsInOrg,
+          # RunLocalTests, RunSpecifiedTests, RunRelevantTests") - Salesforce
+          # doesn't consider a dry-run deployment with zero tests meaningful.
+          # dev/qa skip tests on the real deploy instead (see
+          # deploy-destination.yml), which is where NoTestRun is actually valid.
           if ! VALIDATION_RESULT=$(sf project deploy validate \
                 --manifest delta/package/package.xml \
                 --target-org target-org \
-                --test-level "${{ needs.determine-environment.outputs.test_level }}" \
+                --test-level RunLocalTests \
                 --wait 30 \
                 --json); then
             echo "$VALIDATION_RESULT" | jq . 2>/dev/null || echo "$VALIDATION_RESULT"
