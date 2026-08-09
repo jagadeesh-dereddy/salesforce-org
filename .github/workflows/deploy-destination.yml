@@ -1,126 +1,220 @@
-name: Deploy to Dev Environment
+name: Deploy to Salesforce Environment
+
+# Real deploys happen here, one per environment branch:
+#   dev -> Dev org, qa -> QA/Integration org, uat -> UAT org, release -> Production org
+# `master` is intentionally excluded: it only accumulates the released,
+# already-deployed history after a release branch has shipped to
+# Production - merging into it does not trigger another deploy.
+#
+# Deploying to `uat`/`production` should require a human approval: configure
+# "Required reviewers" on the corresponding GitHub Environment (Settings ->
+# Environments) so the job pauses for sign-off before it runs. This is not
+# expressible in YAML - it must be configured on the Environment itself.
 
 on:
   push:
-    branches: [ OrgDestination ]
+    branches: [ dev, qa, uat, release ]
     paths:
       - 'force-app/**'
       - 'manifest/**'
   workflow_dispatch:
     inputs:
+      environment:
+        description: 'Environment to deploy to (only needed for a manual run)'
+        required: true
+        type: choice
+        options: [ dev, qa, uat, production ]
       from_ref:
-        description: 'Git ref/SHA to diff from (defaults to the previous commit)'
+        description: 'Git ref/SHA to diff from (defaults to the previous commit on this branch)'
         required: false
         type: string
+
+permissions:
+  contents: read
 
 env:
   SF_USE_GENERIC_UNIX_KEYCHAIN: true
   SF_DOMAIN_RETRY: 300
+  # GitHub-hosted runners prefer IPv6 DNS resolution, which can hang/fail
+  # when calling Salesforce's API endpoints via Node's fetch. Force IPv4.
   NODE_OPTIONS: --dns-result-order=ipv4first
   SF_DISABLE_APP_HUB: true
-  SF_LOG_LEVEL: DEBUG
+  SF_LOG_LEVEL: WARN
 
 jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.map.outputs.environment }}
+    steps:
+      - name: Map branch to Salesforce environment
+        id: map
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.environment }}" ]; then
+            ENVIRONMENT="${{ inputs.environment }}"
+          else
+            case "${{ github.ref_name }}" in
+              dev)     ENVIRONMENT="dev" ;;
+              qa)      ENVIRONMENT="qa" ;;
+              uat)     ENVIRONMENT="uat" ;;
+              release) ENVIRONMENT="production" ;;
+              *)
+                echo "::error::No environment mapping defined for branch '${{ github.ref_name }}'"
+                exit 1
+                ;;
+            esac
+          fi
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "Deploying branch '${{ github.ref_name }}' -> the '$ENVIRONMENT' org"
+
   deploy:
+    needs: determine-environment
+    # Picks up this environment's own secrets, and - critically - any
+    # required-reviewer protection rule configured on it in GitHub Settings.
+    # That reviewer gate is the actual production safety control; nothing
+    # in this file can substitute for it.
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    # One deploy at a time per environment, and never cancel one that's
+    # already running mid-deploy - queue behind it instead.
+    concurrency:
+      group: deploy-${{ needs.determine-environment.outputs.environment }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
 
       - name: Install Salesforce CLI
         run: |
-          npm install -g @salesforce/cli
+          set -euo pipefail
+          npm install -g @salesforce/cli@2.146.3
           sf --version
 
-      - name: Install SFDX Git Delta
+      - name: Install SFDX Git Delta plugin
         run: |
-          echo y | sf plugins install sfdx-git-delta
+          set -euo pipefail
+          echo y | sf plugins install sfdx-git-delta@6.45.1
 
-      - name: Create JWT Key File
+      - name: Write JWT key to a restricted temp file
         run: |
-          echo "${{ secrets.SF_JWT_KEY }}" > jwt-key.txt
-          chmod 600 jwt-key.txt
+          set -euo pipefail
+          umask 077
+          printf '%s' "${{ secrets.SF_JWT_KEY }}" > "$RUNNER_TEMP/jwt-key.txt"
 
-      - name: Authenticate to Salesforce
+      - name: Authenticate to Salesforce (JWT bearer flow)
         run: |
+          set -euo pipefail
           sf org login jwt \
-            --client-id ${{ secrets.SF_CLIENT_ID }} \
-            --jwt-key-file jwt-key.txt \
-            --username ${{ secrets.SF_USERNAME }} \
-            --instance-url ${{ secrets.SF_INSTANCE_URL }} \
+            --client-id "${{ secrets.SF_CLIENT_ID }}" \
+            --jwt-key-file "$RUNNER_TEMP/jwt-key.txt" \
+            --username "${{ secrets.SF_USERNAME }}" \
+            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
             --alias target-org \
             --set-default
 
-      - name: Verify Authentication
+      - name: Verify authentication and target org identity
         run: |
-          sf org display --target-org target-org
+          set -euo pipefail
+          ORG_INFO=$(sf org display --target-org target-org --json)
+          ORG_ID=$(echo "$ORG_INFO" | jq -r '.result.id')
+          echo "Authenticated to org: $ORG_ID"
 
-      - name: Generate Delta Package
+          # Optional guardrail: if an environment defines SF_EXPECTED_ORG_ID,
+          # refuse to continue on a mismatch, e.g. UAT credentials
+          # accidentally saved under the Production GitHub Environment.
+          if [ -n "${{ secrets.SF_EXPECTED_ORG_ID }}" ] && [ "$ORG_ID" != "${{ secrets.SF_EXPECTED_ORG_ID }}" ]; then
+            echo "::error::Authenticated org ($ORG_ID) does not match SF_EXPECTED_ORG_ID configured for the '${{ needs.determine-environment.outputs.environment }}' environment. Refusing to continue - check for a secrets misconfiguration."
+            exit 1
+          fi
+
+      - name: Generate delta package
         run: |
+          set -euo pipefail
           BEFORE_SHA="${{ inputs.from_ref || github.event.before }}"
           AFTER_SHA="${{ github.sha }}"
 
-          # On the branch's first push (or a manual dispatch with no from_ref),
-          # github.event.before is empty/all-zeros - fall back to the parent commit.
+          # On the branch's first push (or a manual dispatch with no
+          # from_ref), github.event.before is empty/all-zeros - fall back
+          # to diffing against the parent commit instead.
           if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
             BEFORE_SHA=$(git rev-parse "$AFTER_SHA^" 2>/dev/null || echo "$AFTER_SHA")
           fi
 
           echo "Generating delta package between $BEFORE_SHA and $AFTER_SHA"
-
           mkdir -p delta
 
           sf sgd:source:delta \
-            --to $AFTER_SHA \
-            --from $BEFORE_SHA \
+            --to "$AFTER_SHA" \
+            --from "$BEFORE_SHA" \
             --output-dir delta \
             --generate-delta
 
           echo "Generated package.xml:"
-          if [ -f "delta/package/package.xml" ]; then
-            cat delta/package/package.xml
-          else
-            echo "No package.xml generated"
-          fi
+          cat delta/package/package.xml 2>/dev/null || echo "No package.xml generated"
 
           if [ ! -f "delta/package/package.xml" ] || ! grep -q "<members>" delta/package/package.xml; then
-            echo "No metadata changes detected"
-            echo "SKIP_DEPLOYMENT=true" >> $GITHUB_ENV
+            echo "No metadata changes detected - nothing to deploy"
+            echo "SKIP_DEPLOYMENT=true" >> "$GITHUB_ENV"
           else
-            echo "SKIP_DEPLOYMENT=false" >> $GITHUB_ENV
+            echo "SKIP_DEPLOYMENT=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Validate Deployment
+      - name: Validate deployment
         id: validate_step
         if: env.SKIP_DEPLOYMENT == 'false'
         run: |
-          echo "Starting validation deployment..."
+          set -euo pipefail
+          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' before deploying"
 
-          VALIDATION_RESULT=$(sf project deploy validate \
-            --manifest delta/package/package.xml \
-            --target-org target-org \
-            --test-level RunLocalTests \
-            --wait 30 \
-            --json)
+          if ! VALIDATION_RESULT=$(sf project deploy validate \
+                --manifest delta/package/package.xml \
+                --target-org target-org \
+                --test-level RunLocalTests \
+                --wait 30 \
+                --json); then
+            echo "$VALIDATION_RESULT" | jq . 2>/dev/null || echo "$VALIDATION_RESULT"
+            echo "::error::Validation failed - aborting before any deploy is attempted"
+            exit 1
+          fi
 
           DEPLOY_ID=$(echo "$VALIDATION_RESULT" | jq -r '.result.id')
-          echo "validation_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+          echo "validation_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
           echo "Validation ID: $DEPLOY_ID"
 
-      - name: Deploy to Target Org
-        if: success() && steps.validate_step.outputs.validation_id
+      - name: Deploy to target org (quick deploy of the already-validated package)
+        if: env.SKIP_DEPLOYMENT == 'false' && steps.validate_step.outputs.validation_id
         run: |
-          echo "Starting quick deployment using ID: ${{ steps.validate_step.outputs.validation_id }}"
+          set -euo pipefail
+          echo "Quick-deploying validated package ${{ steps.validate_step.outputs.validation_id }} to '${{ needs.determine-environment.outputs.environment }}'"
+
           sf project deploy quick \
-            --job-id ${{ steps.validate_step.outputs.validation_id }} \
+            --job-id "${{ steps.validate_step.outputs.validation_id }}" \
             --target-org target-org \
-            --wait 30 \
-            --verbose
+            --wait 30
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy summary"
+            echo "- **Environment:** ${{ needs.determine-environment.outputs.environment }}"
+            echo "- **Branch:** ${{ github.ref_name }}"
+            echo "- **Commit:** ${{ github.sha }}"
+            echo "- **Validation ID:** ${{ steps.validate_step.outputs.validation_id || 'n/a (no changes deployed)' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revoke Salesforce session and remove key material
+        if: always()
+        run: |
+          sf org logout --target-org target-org --no-prompt || true
+          rm -f "$RUNNER_TEMP/jwt-key.txt"

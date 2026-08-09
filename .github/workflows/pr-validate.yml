@@ -1,98 +1,189 @@
 name: Validate Deployment (PR gate)
 
+# Runs as the merge gate for every promotion PR in the pipeline:
+#   feature/* -> dev -> qa -> uat -> release -> master
+# Each target branch maps to one Salesforce environment/org. This workflow
+# never deploys - it only runs `sf project deploy validate` (a server-side
+# dry run) so a bad PR is caught before merge, with zero risk to the org.
+
 on:
   pull_request:
-    branches: [ OrgSource ]
+    branches: [ dev, qa, uat, release, master ]
     paths:
       - 'force-app/**'
       - 'manifest/**'
 
+# Least-privilege default: this workflow only reads the repo and calls out
+# to Salesforce; it never needs to write back to GitHub.
+permissions:
+  contents: read
+
+# Superseding stale runs on new pushes to the same PR avoids wasting a
+# validate slot against the org and avoids two runs racing for the same
+# environment.
+concurrency:
+  group: pr-validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   SF_USE_GENERIC_UNIX_KEYCHAIN: true
   SF_DOMAIN_RETRY: 300
+  # GitHub-hosted runners prefer IPv6 DNS resolution, which can hang/fail
+  # when calling Salesforce's API endpoints via Node's fetch. Force IPv4.
   NODE_OPTIONS: --dns-result-order=ipv4first
   SF_DISABLE_APP_HUB: true
-  SF_LOG_LEVEL: DEBUG
+  SF_LOG_LEVEL: WARN
 
 jobs:
-  validate-deployment:
+  # Resolves which Salesforce environment (and therefore which GitHub
+  # Environment / secret set) this PR's target branch corresponds to.
+  # Keeping this as its own job means the mapping is defined once, and the
+  # `validate` job's `environment:` can be set dynamically from its output.
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.map.outputs.environment }}
+    steps:
+      - name: Map target branch to Salesforce environment
+        id: map
+        run: |
+          set -euo pipefail
+          case "${{ github.base_ref }}" in
+            dev)     ENVIRONMENT="dev" ;;
+            qa)      ENVIRONMENT="qa" ;;
+            uat)     ENVIRONMENT="uat" ;;
+            release) ENVIRONMENT="production" ;;
+            master)  ENVIRONMENT="production" ;;
+            *)
+              echo "::error::No environment mapping defined for base branch '${{ github.base_ref }}'"
+              exit 1
+              ;;
+          esac
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "PR into '${{ github.base_ref }}' -> validating against the '$ENVIRONMENT' org"
+
+  validate:
+    needs: determine-environment
+    # Selecting the GitHub Environment here means this job automatically
+    # picks up that environment's own SF_CLIENT_ID / SF_USERNAME /
+    # SF_INSTANCE_URL / SF_JWT_KEY secrets (same names, different values
+    # per environment) and any protection rules configured on it (e.g.
+    # required reviewers before touching the production/UAT org).
+    environment: ${{ needs.determine-environment.outputs.environment }}
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
           fetch-depth: 0
+          # We only ever read the checkout; don't leave a push-capable
+          # git credential lying around on the runner.
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
 
       - name: Install Salesforce CLI
         run: |
-          npm install -g @salesforce/cli
+          set -euo pipefail
+          # Pinned deliberately: silent auto-upgrades of the CLI are a
+          # supply-chain risk and have broken this pipeline before (flag
+          # renames between versions). Bump intentionally, via PR review.
+          npm install -g @salesforce/cli@2.146.3
           sf --version
 
-      - name: Install SFDX Git Delta
+      - name: Install SFDX Git Delta plugin
         run: |
-          echo y | sf plugins install sfdx-git-delta
+          set -euo pipefail
+          echo y | sf plugins install sfdx-git-delta@6.45.1
 
-      - name: Create JWT Key File
+      - name: Write JWT key to a restricted temp file
         run: |
-          echo "${{ secrets.SF_JWT_KEY }}" > jwt-key.txt
-          chmod 600 jwt-key.txt
+          set -euo pipefail
+          umask 077
+          printf '%s' "${{ secrets.SF_JWT_KEY }}" > "$RUNNER_TEMP/jwt-key.txt"
 
-      - name: Authenticate to Salesforce
+      - name: Authenticate to Salesforce (JWT bearer flow)
         run: |
+          set -euo pipefail
           sf org login jwt \
-            --client-id ${{ secrets.SF_CLIENT_ID }} \
-            --jwt-key-file jwt-key.txt \
-            --username ${{ secrets.SF_USERNAME }} \
-            --instance-url ${{ secrets.SF_INSTANCE_URL }} \
+            --client-id "${{ secrets.SF_CLIENT_ID }}" \
+            --jwt-key-file "$RUNNER_TEMP/jwt-key.txt" \
+            --username "${{ secrets.SF_USERNAME }}" \
+            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
             --alias target-org \
             --set-default
 
-      - name: Verify Authentication
+      - name: Verify authentication and target org identity
         run: |
-          sf org display --target-org target-org
+          set -euo pipefail
+          ORG_INFO=$(sf org display --target-org target-org --json)
+          ORG_ID=$(echo "$ORG_INFO" | jq -r '.result.id')
+          echo "Authenticated to org: $ORG_ID"
 
-      - name: Generate Delta Package
+          # Optional guardrail: if an environment defines SF_EXPECTED_ORG_ID,
+          # refuse to continue on a mismatch. This catches the scenario
+          # where a secret was pasted into the wrong GitHub Environment
+          # (e.g. UAT credentials saved under Production) before anything
+          # gets validated against the wrong org.
+          if [ -n "${{ secrets.SF_EXPECTED_ORG_ID }}" ] && [ "$ORG_ID" != "${{ secrets.SF_EXPECTED_ORG_ID }}" ]; then
+            echo "::error::Authenticated org ($ORG_ID) does not match SF_EXPECTED_ORG_ID configured for the '${{ needs.determine-environment.outputs.environment }}' environment. Refusing to continue - check for a secrets misconfiguration."
+            exit 1
+          fi
+
+      - name: Generate delta package (PR head vs. target branch)
         run: |
+          set -euo pipefail
           BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
           echo "Generating delta package between origin/$BASE_BRANCH and $HEAD_SHA"
-
           mkdir -p delta
 
           sf sgd:source:delta \
-            --to $HEAD_SHA \
-            --from origin/$BASE_BRANCH \
+            --to "$HEAD_SHA" \
+            --from "origin/$BASE_BRANCH" \
             --output-dir delta \
             --generate-delta
 
           echo "Generated package.xml:"
-          if [ -f "delta/package/package.xml" ]; then
-            cat delta/package/package.xml
-          else
-            echo "No package.xml generated"
-          fi
+          cat delta/package/package.xml 2>/dev/null || echo "No package.xml generated"
 
+          # A delta with no <members> (e.g. only comments/formatting changed
+          # in a way git-delta ignores) still produces a well-formed but
+          # empty package.xml. Deploying/validating an empty package fails
+          # against the Salesforce API, so treat it as "nothing to do".
           if [ ! -f "delta/package/package.xml" ] || ! grep -q "<members>" delta/package/package.xml; then
-            echo "No metadata changes detected"
-            echo "SKIP_VALIDATION=true" >> $GITHUB_ENV
+            echo "No metadata changes detected - nothing to validate"
+            echo "SKIP_VALIDATION=true" >> "$GITHUB_ENV"
           else
-            echo "SKIP_VALIDATION=false" >> $GITHUB_ENV
+            echo "SKIP_VALIDATION=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Validate Deployment (dry run, no deploy)
+      - name: Validate deployment (dry run, no deploy)
         if: env.SKIP_VALIDATION == 'false'
         run: |
-          echo "Starting validation-only deployment (merge gate)..."
+          set -euo pipefail
+          echo "Validating against '${{ needs.determine-environment.outputs.environment }}' (merge gate only - nothing is deployed)"
 
-          sf project deploy validate \
-            --manifest delta/package/package.xml \
-            --target-org target-org \
-            --test-level RunLocalTests \
-            --wait 30
+          if ! VALIDATION_RESULT=$(sf project deploy validate \
+                --manifest delta/package/package.xml \
+                --target-org target-org \
+                --test-level RunLocalTests \
+                --wait 30 \
+                --json); then
+            echo "$VALIDATION_RESULT" | jq . 2>/dev/null || echo "$VALIDATION_RESULT"
+            echo "::error::Validation failed against '${{ needs.determine-environment.outputs.environment }}'"
+            exit 1
+          fi
+
+          echo "$VALIDATION_RESULT" | jq .
+
+      - name: Revoke Salesforce session and remove key material
+        if: always()
+        run: |
+          sf org logout --target-org target-org --no-prompt || true
+          rm -f "$RUNNER_TEMP/jwt-key.txt"
