@@ -103,17 +103,30 @@ jobs:
       - name: Authenticate to Salesforce (JWT bearer flow)
         run: |
           set -euo pipefail
-          # Write and consume the key in the same step, back to back, so
-          # there's no window between steps where a concurrent job on a
-          # shared self-hosted runner could clear $RUNNER_TEMP out from
-          # under this one (GitHub only guarantees a clean $RUNNER_TEMP at
-          # the *start* of a job on self-hosted runners - it does not
-          # guarantee exclusive use of it for the job's full duration if
-          # the runner picks up an overlapping job).
+          # Write, decrypt (if needed), and consume the key in the same
+          # step, back to back, so there's no window between steps where a
+          # concurrent job on a shared self-hosted runner could clear
+          # $RUNNER_TEMP out from under this one (GitHub only guarantees a
+          # clean $RUNNER_TEMP at the *start* of a job on self-hosted
+          # runners - it does not guarantee exclusive use of it for the
+          # job's full duration if the runner picks up an overlapping job).
           umask 077
+          RAW_KEY_FILE="$(mktemp "$RUNNER_TEMP/jwt-key-raw.XXXXXX")"
           JWT_KEY_FILE="$(mktemp "$RUNNER_TEMP/jwt-key.XXXXXX")"
-          trap 'rm -f "$JWT_KEY_FILE"' EXIT
-          printf '%s' "${{ secrets.SF_JWT_KEY }}" > "$JWT_KEY_FILE"
+          trap 'rm -f "$RAW_KEY_FILE" "$JWT_KEY_FILE"' EXIT
+          printf '%s' "${{ secrets.SF_JWT_KEY }}" > "$RAW_KEY_FILE"
+
+          # Decrypts a passphrase-protected key (e.g. exported from an
+          # enterprise CA/cert manager like Venafi) into a plain key the CLI
+          # can use. Safe to run unconditionally, even when SF_JWT_KEY is
+          # already unencrypted: openssl silently ignores -passin when the
+          # input key doesn't need it, so this is a no-op pass-through for
+          # environments whose key was never encrypted in the first place.
+          # (-passin env:... avoids the passphrase ever appearing as a
+          # command-line argument, where it would be visible to other
+          # processes on a shared runner via `ps`.)
+          export SF_JWT_KEY_PASSPHRASE="${{ secrets.SF_JWT_KEY_PASSPHRASE }}"
+          openssl pkey -in "$RAW_KEY_FILE" -passin env:SF_JWT_KEY_PASSPHRASE -out "$JWT_KEY_FILE"
 
           sf org login jwt \
             --client-id "${{ secrets.SF_CLIENT_ID }}" \
@@ -123,7 +136,7 @@ jobs:
             --alias target-org \
             --set-default
 
-          rm -f "$JWT_KEY_FILE"
+          rm -f "$RAW_KEY_FILE" "$JWT_KEY_FILE"
 
       - name: Verify authentication and target org identity
         run: |
@@ -204,4 +217,4 @@ jobs:
           # The auth step already removes its own key file (via trap and on
           # success); this is just a belt-and-braces sweep for anything left
           # behind by an interrupted run.
-          rm -f "$RUNNER_TEMP"/jwt-key.* 2>/dev/null || true
+          rm -f "$RUNNER_TEMP"/jwt-key* 2>/dev/null || true
