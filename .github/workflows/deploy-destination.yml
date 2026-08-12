@@ -117,22 +117,30 @@ jobs:
           set -euo pipefail
           echo y | sf plugins install sfdx-git-delta@6.45.1
 
-      - name: Write JWT key to a restricted temp file
-        run: |
-          set -euo pipefail
-          umask 077
-          printf '%s' "${{ secrets.SF_JWT_KEY }}" > "$RUNNER_TEMP/jwt-key.txt"
-
       - name: Authenticate to Salesforce (JWT bearer flow)
         run: |
           set -euo pipefail
+          # Write and consume the key in the same step, back to back, so
+          # there's no window between steps where a concurrent job on a
+          # shared self-hosted runner could clear $RUNNER_TEMP out from
+          # under this one (GitHub only guarantees a clean $RUNNER_TEMP at
+          # the *start* of a job on self-hosted runners - it does not
+          # guarantee exclusive use of it for the job's full duration if
+          # the runner picks up an overlapping job).
+          umask 077
+          JWT_KEY_FILE="$(mktemp "$RUNNER_TEMP/jwt-key.XXXXXX")"
+          trap 'rm -f "$JWT_KEY_FILE"' EXIT
+          printf '%s' "${{ secrets.SF_JWT_KEY }}" > "$JWT_KEY_FILE"
+
           sf org login jwt \
             --client-id "${{ secrets.SF_CLIENT_ID }}" \
-            --jwt-key-file "$RUNNER_TEMP/jwt-key.txt" \
+            --jwt-key-file "$JWT_KEY_FILE" \
             --username "${{ secrets.SF_USERNAME }}" \
             --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
             --alias target-org \
             --set-default
+
+          rm -f "$JWT_KEY_FILE"
 
       - name: Verify authentication and target org identity
         run: |
@@ -258,4 +266,7 @@ jobs:
         if: always()
         run: |
           sf org logout --target-org target-org --no-prompt || true
-          rm -f "$RUNNER_TEMP/jwt-key.txt"
+          # The auth step already removes its own key file (via trap and on
+          # success); this is just a belt-and-braces sweep for anything left
+          # behind by an interrupted run.
+          rm -f "$RUNNER_TEMP"/jwt-key.* 2>/dev/null || true
