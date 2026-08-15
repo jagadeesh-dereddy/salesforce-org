@@ -126,7 +126,7 @@ jobs:
           # resolution. Update this hash deliberately (via PR review) if
           # the pinned version above is ever bumped.
           EXPECTED_INTEGRITY="sha512-MpAp0VuOnM3QtQmnTm1DVnOI6FaLCR3B/xTbpv7b7W8WsBLb9JQZJUoI/zX8rc/Zi2lXQOFCcQQdWhZ5k9IeqA=="
-          ACTUAL_INTEGRITY="sha512-$(curl -fsSL https://registry.npmjs.org/sfdx-git-delta/-/sfdx-git-delta-6.45.1.tgz | openssl dgst -sha512 -binary | base64)"
+          ACTUAL_INTEGRITY="sha512-$(curl -fsSL https://registry.npmjs.org/sfdx-git-delta/-/sfdx-git-delta-6.45.1.tgz | openssl dgst -sha512 -binary | base64 -w 0)"
           if [ "$ACTUAL_INTEGRITY" != "$EXPECTED_INTEGRITY" ]; then
             echo "::error::sfdx-git-delta@6.45.1 tarball hash mismatch - expected $EXPECTED_INTEGRITY, got $ACTUAL_INTEGRITY. Refusing to install; this could indicate tampering."
             exit 1
