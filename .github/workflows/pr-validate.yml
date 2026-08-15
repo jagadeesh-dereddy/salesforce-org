@@ -98,6 +98,23 @@ jobs:
       - name: Install SFDX Git Delta plugin
         run: |
           set -euo pipefail
+
+          # sfdx-git-delta is a widely-used, third-party (non-Salesforce)
+          # OSS plugin for computing a git-diff-based package.xml - not an
+          # official Salesforce product. Since the version is pinned rather
+          # than "latest" (see the CLI install step above for why), verify
+          # the exact tarball we're about to install still matches its
+          # published integrity hash before trusting it, as an explicit,
+          # auditable supply-chain check independent of npm's own
+          # resolution. Update this hash deliberately (via PR review) if
+          # the pinned version above is ever bumped.
+          EXPECTED_INTEGRITY="sha512-MpAp0VuOnM3QtQmnTm1DVnOI6FaLCR3B/xTbpv7b7W8WsBLb9JQZJUoI/zX8rc/Zi2lXQOFCcQQdWhZ5k9IeqA=="
+          ACTUAL_INTEGRITY="sha512-$(curl -fsSL https://registry.npmjs.org/sfdx-git-delta/-/sfdx-git-delta-6.45.1.tgz | openssl dgst -sha512 -binary | base64)"
+          if [ "$ACTUAL_INTEGRITY" != "$EXPECTED_INTEGRITY" ]; then
+            echo "::error::sfdx-git-delta@6.45.1 tarball hash mismatch - expected $EXPECTED_INTEGRITY, got $ACTUAL_INTEGRITY. Refusing to install; this could indicate tampering."
+            exit 1
+          fi
+
           echo y | sf plugins install sfdx-git-delta@6.45.1
 
       - name: Authenticate to Salesforce (JWT bearer flow)
